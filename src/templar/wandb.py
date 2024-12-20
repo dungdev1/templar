@@ -54,7 +54,7 @@ def initialize_wandb(run_prefix, uid, config, group, job_type):
     # Initialize WandB
     run = wandb.init(
         project=f"{config.project}-v{__version__}",
-        entity='tplr',
+        entity='dungnguyen9599-nf-tech',
         id=run_id,
         resume='must' if run_id else 'never',
         name=f'{run_prefix}{uid}',
