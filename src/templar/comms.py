@@ -233,7 +233,7 @@ async def apply_slices_to_model(
 
     # Log metrics to wandb
     wandb.log({
-        "window": window,
+        "step": max_global_step,
         "mean_norm": mean_norm.item(),
         "std_norm": std_norm.item(),
         "num_slices": num_files,
