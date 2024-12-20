@@ -43,7 +43,7 @@ from .config import (
 from templar.constants import CF_REGION_NAME
 from templar.logging import logger
 from templar.schemas import Bucket
-
+import wandb
 
 def get_base_url(account_id: str) -> str:
     """Gets the base URL for Cloudflare R2 storage.
@@ -173,83 +173,75 @@ async def apply_slices_to_model(
     """
     max_global_step = 0
     indices_dict = await get_indices_for_window(model, seed, compression)
-    slice_files = await load_files_for_window(
-        window=window, save_location=save_location, key=key
-    )
+    slice_files = await load_files_for_window(window=window, save_location=save_location, key=key)
 
-    param_sums = {
-        name: torch.zeros(
-            len(indices_dict[name]), dtype=param.data.dtype, device=model.device
-        )
-        for name, param in model.named_parameters()
-        if name in indices_dict
-    }
-    slice_norms = []  # Collect norms for computing median
-    num_files = 0  # Track the number of valid files
+    param_sums = {name: torch.zeros(len(indices_dict[name]), dtype=param.data.dtype, device=model.device)
+                  for name, param in model.named_parameters() if name in indices_dict}
+    slice_norms = []
+    num_files = 0
+    outlier_count = 0  # Count the number of outliers
+
+    slice_file_names = []  # Track file names for each slice norm
 
     for file_i in slice_files:
         try:
-            filename = os.path.basename(file_i)
-            match = re.match(
-                rf"^{key}-{window}-.+-v{re.escape(__version__)}\.pt$",
-                filename,
-            )
-            if not match:
-                logger.warning(
-                    f"Skipping file {file_i} due to version mismatch in filename."
-                )
-                continue
-
             slice_i = await get_slices(file_i, model.device)
             slice_global_step = slice_i.get("global_step")
-
             if slice_global_step is None:
-                logger.warning(
-                    f"Skipping slice {file_i} because it has no global_step."
-                )
+                logger.warning(f"Skipping slice {file_i}: No global_step.")
                 continue
-
             max_global_step = max(max_global_step, slice_global_step)
 
-            # Compute norm of the slice
             slice_norm = 0.0
             slice_values = {}
-
             for name, param in model.named_parameters():
                 if name not in indices_dict or name not in slice_i:
                     continue
                 values = slice_i[name].to(model.device)
-                slice_norm += torch.norm(values, p=2).item() ** 2  # Square of L2 norm
+                slice_norm += torch.norm(values, p=2).item() ** 2
                 slice_values[name] = values
+            slice_norm = torch.sqrt(torch.tensor(slice_norm)) + 1e-8
+            slice_norms.append(slice_norm.item())
+            slice_file_names.append(file_i)  # Track the file name
+            num_files += 1
 
-            slice_norm = (
-                np.sqrt(slice_norm) + 1e-8
-            )  # Add epsilon to avoid division by zero
-            slice_norms.append(slice_norm)  # Collect norm for computing median
-            num_files += 1  # Increment valid file count
-
-            # Normalize and accumulate
+            # Add slice values to the parameter sum
             for name, values in slice_values.items():
-                normalized_values = values / slice_norm
-                param_sums[name] += normalized_values
+                param_sums[name] += values / slice_norm
 
-            del slice_i, slice_values
-
-        except Timeout:
-            logger.error(f"Timeout occurred while trying to acquire lock on {file_i}")
-            continue
         except Exception as e:
-            logger.exception(f"Error applying slice from {file_i}: {e}")
+            logger.exception(f"Error processing slice {file_i}: {e}")
             continue
 
     if not num_files or not slice_norms:
         logger.warning(f"No valid slices found for window {window}")
         return max_global_step
 
-    # Compute median norm
+    # Compute mean and std for outlier detection
+    slice_norms_tensor = torch.tensor(slice_norms)
+    mean_norm = torch.mean(slice_norms_tensor)
     median_norm = torch.median(torch.tensor(slice_norms))
+    std_norm = torch.std(slice_norms_tensor)
 
-    # Apply the average of normalized slices to the parameters and scale by median_norm
+    # Identify and log outliers
+    outlier_indices = [
+        i for i, norm in enumerate(slice_norms) if abs(norm - mean_norm.item()) > 3 * std_norm.item()
+    ]
+    outlier_count = len(outlier_indices)
+    for i in outlier_indices:
+        logger.warning(f"Outlier detected: File {slice_file_names[i]} with norm {slice_norms[i]}")
+
+    # Log metrics to wandb
+    wandb.log({
+        "window": window,
+        "mean_norm": mean_norm.item(),
+        "std_norm": std_norm.item(),
+        "num_slices": num_files,
+        "num_outliers": outlier_count,
+        "outlier_percentage": (outlier_count / num_files) * 100 if num_files > 0 else 0,
+    })
+
+    # Compute average and apply to the model
     for name, param in model.named_parameters():
         if name not in indices_dict:
             continue
